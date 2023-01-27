@@ -129,6 +129,8 @@ final class CaffeinatedGuavaLoadingCache<K, V>
   }
 
   abstract static class CaffeinatedLoader<K, V> implements CacheLoader<K, V>, Serializable {
+    private static final long serialVersionUID = 1L;
+
     final com.google.common.cache.CacheLoader<K, V> cacheLoader;
 
     CaffeinatedLoader(com.google.common.cache.CacheLoader<K, V> cacheLoader) {

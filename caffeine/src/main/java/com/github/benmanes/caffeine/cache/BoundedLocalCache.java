@@ -252,6 +252,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
   @Nullable volatile ConcurrentMap<Object, CompletableFuture<?>> refreshes;
 
   /** Creates an instance based on the builder's configuration. */
+  @SuppressWarnings("GuardedBy")
   protected BoundedLocalCache(Caffeine<K, V> builder,
       @Nullable AsyncCacheLoader<K, V> cacheLoader, boolean isAsync) {
     this.isAsync = isAsync;
@@ -1529,6 +1530,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
     } finally {
       evictionLock.unlock();
     }
+    rescheduleCleanUpIfIncomplete();
   }
 
   /** Acquires the eviction lock. */
@@ -1637,8 +1639,39 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
     } finally {
       evictionLock.unlock();
     }
-    if ((drainStatusOpaque() == REQUIRED) && (executor == ForkJoinPool.commonPool())) {
+    rescheduleCleanUpIfIncomplete();
+  }
+
+  /**
+   * If there remains pending operations that were not handled by the prior clean up then try to
+   * schedule an asynchronous maintenance task. This may occur due to a concurrent write after the
+   * maintenance work had started or if the amortized threshold of work per clean up was reached.
+   */
+  void rescheduleCleanUpIfIncomplete() {
+    if (drainStatusOpaque() != REQUIRED) {
+      return;
+    }
+
+    // An immediate scheduling cannot be performed on a custom executor because it may use a
+    // caller-runs policy. This could cause the caller's penalty to exceed the amortized threshold,
+    // e.g. repeated concurrent writes could result in a retry loop.
+    if (executor == ForkJoinPool.commonPool()) {
       scheduleDrainBuffers();
+      return;
+    }
+
+    // If a scheduler was configured then the maintenance can be deferred onto the custom executor
+    // to be run in the near future. This is only used if there is no scheduled set, else the next
+    // run depends on other activity to trigger it.
+    var pacer = pacer();
+    if ((pacer != null) && !pacer.isScheduled() && evictionLock.tryLock()) {
+      try {
+        if ((drainStatusOpaque() == REQUIRED) && !pacer.isScheduled()) {
+          pacer.schedule(executor, drainBuffersTask, expirationTicker().read(), Pacer.TOLERANCE);
+        }
+      } finally {
+        evictionLock.unlock();
+      }
     }
   }
 
@@ -1669,7 +1702,8 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
 
       climb();
     } finally {
-      if ((drainStatusOpaque() != PROCESSING_TO_IDLE) || !casDrainStatus(PROCESSING_TO_IDLE, IDLE)) {
+      if ((drainStatusOpaque() != PROCESSING_TO_IDLE)
+          || !casDrainStatus(PROCESSING_TO_IDLE, IDLE)) {
         setDrainStatusOpaque(REQUIRED);
       }
     }
@@ -1989,21 +2023,16 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
   }
 
   @Override
-  @SuppressWarnings("FutureReturnValueIgnored")
   public void clear() {
     evictionLock.lock();
     try {
-      long now = expirationTicker().read();
+      // Discard all pending reads
+      readBuffer.drainTo(e -> {});
 
       // Apply all pending writes
       Runnable task;
       while ((task = writeBuffer.poll()) != null) {
         task.run();
-      }
-
-      // Discard all entries
-      for (var entry : data.entrySet()) {
-        removeNode(entry.getValue(), now);
       }
 
       // Cancel the scheduled cleanup
@@ -2012,10 +2041,23 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
         pacer.cancel();
       }
 
-      // Discard all pending reads
-      readBuffer.drainTo(e -> {});
+      // Discard all entries
+      int threshold = (WRITE_BUFFER_MAX / 2);
+      long now = expirationTicker().read();
+      for (var node : data.values()) {
+        if (writeBuffer.size() >= threshold) {
+          // Fallback to one-by-one to avoid excessive lock hold times
+          break;
+        }
+        removeNode(node, now);
+      }
     } finally {
       evictionLock.unlock();
+    }
+
+    // Remove any stragglers, such as if released early to more aggressively flush incoming writes
+    for (Object key : keySet()) {
+      remove(key);
     }
   }
 
@@ -2929,7 +2971,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
    * there are no modifications to the information used. Therefore, usages should expect that this
    * operation may return misleading results if either the maps or the data held by them is modified
    * during the execution of this method. This characteristic allows for comparing the map sizes and
-   * assuming stable mappings, as done by {@link AbstractMap}-based maps.
+   * assuming stable mappings, as done by {@link java.util.AbstractMap}-based maps.
    * <p>
    * The <i>symmetric</i> property requires that the result is the same for all implementations of
    * {@link Map#equals(Object)}. That contract is defined in terms of the stable mappings provided
@@ -3113,6 +3155,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
       }
     } finally {
       evictionLock.unlock();
+      rescheduleCleanUpIfIncomplete();
     }
   }
 
@@ -4019,9 +4062,13 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
         if (cache.evicts() && isWeighted()) {
           cache.evictionLock.lock();
           try {
+            if (cache.drainStatusOpaque() == REQUIRED) {
+              cache.maintenance(/* ignored */ null);
+            }
             return OptionalLong.of(Math.max(0, cache.weightedSize()));
           } finally {
             cache.evictionLock.unlock();
+            cache.rescheduleCleanUpIfIncomplete();
           }
         }
         return OptionalLong.empty();
@@ -4029,9 +4076,13 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
       @Override public long getMaximum() {
         cache.evictionLock.lock();
         try {
+          if (cache.drainStatusOpaque() == REQUIRED) {
+            cache.maintenance(/* ignored */ null);
+          }
           return cache.maximum();
         } finally {
           cache.evictionLock.unlock();
+          cache.rescheduleCleanUpIfIncomplete();
         }
       }
       @Override public void setMaximum(long maximum) {
@@ -4041,6 +4092,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
           cache.maintenance(/* ignored */ null);
         } finally {
           cache.evictionLock.unlock();
+          cache.rescheduleCleanUpIfIncomplete();
         }
       }
       @Override public Map<K, V> coldest(int limit) {
